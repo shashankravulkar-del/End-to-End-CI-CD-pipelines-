@@ -1,0 +1,173 @@
+// ==============================================================================
+// Declarative Jenkinsfile: End-to-End CI/CD Pipeline
+// Project: End-to-End CI/CD Pipeline Automation Using Jenkins, Docker, K8s & AWS
+// ==============================================================================
+
+pipeline {
+    agent any
+
+    tools {
+        maven 'Maven-3.9'
+        jdk 'JDK-17'
+    }
+
+    environment {
+        // Docker registry settings - replace 'yourusername' with your Docker Hub ID
+        DOCKER_HUB_USER = 'yourusername'
+        IMAGE_NAME      = 'devops-java-app'
+        IMAGE_TAG       = "build-${env.BUILD_NUMBER}"
+        FULL_IMAGE_NAME = "${DOCKER_HUB_USER}/${IMAGE_NAME}:${IMAGE_TAG}"
+        LATEST_IMAGE    = "${DOCKER_HUB_USER}/${IMAGE_NAME}:latest"
+        
+        // Jenkins Credentials IDs configured in Jenkins Credentials Store
+        DOCKER_CRED_ID  = 'dockerhub-credentials'
+        SONAR_SERVER_NAME = 'SonarQube-Server'
+        
+        // Kubernetes configuration
+        K8S_NAMESPACE   = 'default'
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10', artifactNumToKeepStr: '5'))
+        timeout(time: 30, unit: 'MINUTES')
+        ansiColor('xterm')
+        disableConcurrentBuilds()
+    }
+
+    stages {
+        stage('1. Checkout Code') {
+            steps {
+                echo ">>> Pulling latest source code from GitHub repository... <<<"
+                checkout scm
+                sh 'git log -1 --stat'
+            }
+        }
+
+        stage('2. Build & Unit Tests') {
+            steps {
+                echo ">>> Compiling Java source code and running JUnit 5 tests via Maven... <<<"
+                sh 'mvn clean test -B'
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: '**/target/surefire-reports/*.xml'
+                }
+            }
+        }
+
+        stage('3. SonarQube Analysis') {
+            steps {
+                echo ">>> Performing Static Code Analysis & Security Scan via SonarQube... <<<"
+                withSonarQubeEnv(SONAR_SERVER_NAME) {
+                    sh '''
+                        mvn sonar:sonar \
+                          -Dsonar.projectKey=devops-java-app \
+                          -Dsonar.projectName="DevOps Java Application" \
+                          -Dsonar.java.binaries=target/classes \
+                          -B
+                    '''
+                }
+            }
+        }
+
+        stage('4. Quality Gate Check') {
+            steps {
+                echo ">>> Waiting for SonarQube Quality Gate webhook callback... <<<"
+                timeout(time: 5, unit: 'MINUTES') {
+                    script {
+                        def qg = waitForQualityGate()
+                        if (qg.status != 'OK') {
+                            error "Pipeline aborted: SonarQube Quality Gate status is ${qg.status}. Code bugs, vulnerabilities, or coverage criteria violated!"
+                        }
+                        echo ">>> SonarQube Quality Gate passed successfully with status: ${qg.status} <<<"
+                    }
+                }
+            }
+        }
+
+        stage('5. Docker Image Build') {
+            steps {
+                echo ">>> Building multi-stage Docker image: ${FULL_IMAGE_NAME} ... <<<"
+                sh """
+                    docker build -t ${FULL_IMAGE_NAME} -t ${LATEST_IMAGE} .
+                    docker images | grep ${IMAGE_NAME}
+                """
+            }
+        }
+
+        stage('6. Vulnerability Scan') {
+            steps {
+                echo ">>> Scanning Docker image for critical vulnerabilities using Trivy... <<<"
+                sh """
+                    # Run Trivy scan (will warn on HIGH/CRITICAL CVEs)
+                    if command -v trivy >/dev/null 2>&1; then
+                        trivy image --severity HIGH,CRITICAL --light ${FULL_IMAGE_NAME} || true
+                    else
+                        echo "Trivy not installed on Jenkins agent; skipping image vulnerability scan."
+                    fi
+                """
+            }
+        }
+
+        stage('7. Push Image to Docker Hub') {
+            steps {
+                echo ">>> Authenticating and pushing images to Docker Hub... <<<"
+                withCredentials([usernamePassword(credentialsId: DOCKER_CRED_ID, usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                    sh """
+                        echo "\$DOCKER_PASS" | docker login -u "\$DOCKER_USER" --password-stdin
+                        docker push ${FULL_IMAGE_NAME}
+                        docker push ${LATEST_IMAGE}
+                        docker logout
+                    """
+                }
+            }
+        }
+
+        stage('8. Deploy to Kubernetes') {
+            steps {
+                echo ">>> Applying Kubernetes manifests to cluster... <<<"
+                sh """
+                    # Substitute image tag in deployment manifest
+                    sed -i "s|image: .*devops-java-app:.*|image: ${FULL_IMAGE_NAME}|g" k8s/deployment.yaml
+                    
+                    # Apply ConfigMap, Deployment and Service
+                    kubectl apply -f k8s/configmap.yaml -n ${K8S_NAMESPACE}
+                    kubectl apply -f k8s/deployment.yaml -n ${K8S_NAMESPACE}
+                    kubectl apply -f k8s/service.yaml -n ${K8S_NAMESPACE}
+                """
+            }
+        }
+
+        stage('9. Verify Deployment Rollout') {
+            steps {
+                echo ">>> Verifying Kubernetes rolling update status... <<<"
+                sh """
+                    kubectl rollout status deployment/devops-java-app -n ${K8S_NAMESPACE} --timeout=90s
+                    kubectl get pods -l app=devops-java-app -n ${K8S_NAMESPACE} -o wide
+                    kubectl get svc devops-java-app-service -n ${K8S_NAMESPACE}
+                """
+            }
+        }
+    }
+
+    post {
+        always {
+            echo ">>> Cleaning up dangling build images on agent disk... <<<"
+            sh """
+                docker image prune -f --filter "until=24h" || true
+            """
+        }
+        success {
+            echo "=========================================================================="
+            echo " SUCCESS: Build #${env.BUILD_NUMBER} deployed successfully to Kubernetes!"
+            echo " Service Endpoint accessible via AWS EC2 Public IP on NodePort 30080"
+            echo "=========================================================================="
+        }
+        failure {
+            echo "=========================================================================="
+            echo " FAILED: Pipeline failed at stage: ${env.STAGE_NAME}"
+            echo " Please inspect Jenkins console logs and resolve error."
+            echo "=========================================================================="
+        }
+    }
+}

@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: devops-java-app-config
+  labels:
+    app: devops-java-app
+    tier: backend
+data:
+  APP_ENV: "production-aws"
+  SERVER_PORT: "8080"
+  LOGGING_LEVEL_ROOT: "INFO"
